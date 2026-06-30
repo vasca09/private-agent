@@ -32,6 +32,7 @@ class _SettingsScreenState extends State<SettingsScreen>
   late TextEditingController _telegramTokenController;
   bool _obscureKey = true;
   bool _telegramEnabled = false;
+  bool _autoSwitchModels = true;
   double _maxSteps = 15;
 
   final Map<String, PermissionStatus> _permissions = {};
@@ -47,6 +48,7 @@ class _SettingsScreenState extends State<SettingsScreen>
       text: widget.telegramService.botToken,
     );
     _telegramEnabled = widget.telegramService.isEnabled;
+    _autoSwitchModels = widget.aiService.autoSwitchModels;
     _maxSteps = widget.aiService.maxSteps.toDouble();
     _checkPermissions();
   }
@@ -102,6 +104,7 @@ class _SettingsScreenState extends State<SettingsScreen>
     );
 
     await widget.aiService.saveMaxSteps(_maxSteps.toInt());
+    await widget.aiService.saveAutoSwitchModels(_autoSwitchModels);
 
     if (mounted) {
       ScaffoldMessenger.of(
@@ -236,8 +239,22 @@ class _SettingsScreenState extends State<SettingsScreen>
               ),
             ],
           ),
+          const SizedBox(height: 12),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Auto-switch free models on limit'),
+            subtitle: const Text(
+              'If a free model hits a rate limit (429), out-of-credits (402), '
+              'or server error (502/503), automatically retry with the next '
+              'free OpenRouter model instead of failing. Only applies when '
+              'using OpenRouter.',
+              style: TextStyle(fontSize: 12),
+            ),
+            value: _autoSwitchModels,
+            onChanged: (value) => setState(() => _autoSwitchModels = value),
+          ),
           const SizedBox(height: 24),
-          
+
           Text(
             'Maximum Steps Per Task: ${_maxSteps.toInt()}',
             style: const TextStyle(fontWeight: FontWeight.w500),
