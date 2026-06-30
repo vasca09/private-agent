@@ -7,11 +7,32 @@ class AiService {
   static const String _defaultBaseUrl = 'https://api.deepseek.com';
   static const String _defaultModel = 'deepseek-chat';
 
+  // Free OpenRouter models tried in order when the current one is
+  // rate-limited (429), out of credits (402), or erroring (502/503).
+  // Only used automatically when the base URL points at OpenRouter.
+  static const List<String> _freeFallbackModels = [
+    'google/gemini-2.0-flash-exp:free',
+    'meta-llama/llama-3.2-11b-vision-instruct:free',
+    'qwen/qwen3-coder:free',
+    'mistralai/mistral-small-3.1-24b-instruct:free',
+    'google/gemma-3-27b-it:free',
+  ];
+
+  // Status codes worth retrying with a different free model.
+  static const Set<int> _retryableStatusCodes = {402, 429, 502, 503};
+
   String? _apiKey;
   String _baseUrl = _defaultBaseUrl;
   String _model = _defaultModel;
   int _maxSteps = 15;
+  bool _autoSwitchModels = true;
+  String? _lastWorkingModel;
   final List<Map<String, String>> _conversationHistory = [];
+
+  bool get autoSwitchModels => _autoSwitchModels;
+  String? get lastWorkingModel => _lastWorkingModel;
+
+  bool get _isOpenRouter => _baseUrl.contains('openrouter.ai');
 
   static const String _systemPrompt = '''
 You are PrivateAgent, a helpful AI assistant that controls an Android phone. You can perform device actions and also have normal conversations.
@@ -59,6 +80,13 @@ For normal conversation (questions, chat, info requests), just respond with plai
     _baseUrl = prefs.getString('api_base_url') ?? _defaultBaseUrl;
     _model = prefs.getString('api_model') ?? _defaultModel;
     _maxSteps = prefs.getInt('api_max_steps') ?? 15;
+    _autoSwitchModels = prefs.getBool('auto_switch_models') ?? true;
+  }
+
+  Future<void> saveAutoSwitchModels(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    _autoSwitchModels = value;
+    await prefs.setBool('auto_switch_models', value);
   }
 
   Future<void> saveSettings({
@@ -120,24 +148,75 @@ For normal conversation (questions, chat, info requests), just respond with plai
         ..._conversationHistory,
       ];
 
-      final response = await http.post(
-        Uri.parse('$_baseUrl/chat/completions'),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $_apiKey',
-        },
-        body: jsonEncode({
-          'model': _model,
-          'messages': messages,
-          'temperature': 0.7,
-          'max_tokens': 1024,
-        }),
-      );
+      // Build the list of models to try: current model first, then
+      // (if enabled and on OpenRouter) the free fallback chain.
+      final modelsToTry = <String>[_model];
+      if (_autoSwitchModels && _isOpenRouter) {
+        for (final m in _freeFallbackModels) {
+          if (!modelsToTry.contains(m)) modelsToTry.add(m);
+        }
+      }
+
+      http.Response? response;
+      String? triedModel;
+      Exception? lastError;
+
+      for (final candidateModel in modelsToTry) {
+        triedModel = candidateModel;
+        try {
+          response = await http.post(
+            Uri.parse('$_baseUrl/chat/completions'),
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $_apiKey',
+            },
+            body: jsonEncode({
+              'model': candidateModel,
+              'messages': messages,
+              'temperature': 0.7,
+              'max_tokens': 1024,
+            }),
+          );
+        } catch (e) {
+          lastError = Exception('Network error: $e');
+          continue; // try next model
+        }
+
+        if (response.statusCode == 200) {
+          // Success — remember this model so we report which one worked.
+          _lastWorkingModel = candidateModel;
+          if (candidateModel != _model) {
+            // Persist so next call starts with the model that's actually working.
+            _model = candidateModel;
+            final prefs = await SharedPreferences.getInstance();
+            await prefs.setString('api_model', candidateModel);
+          }
+          break;
+        }
+
+        if (_retryableStatusCodes.contains(response.statusCode)) {
+          lastError = Exception(
+            'API error (${response.statusCode}) on $candidateModel — trying next free model...',
+          );
+          response = null;
+          continue; // try next model in the chain
+        }
+
+        // Non-retryable error (e.g. 401 bad key, 400 bad request) — stop here.
+        break;
+      }
+
+      if (response == null) {
+        throw lastError ?? Exception('All models failed.');
+      }
 
       if (response.statusCode != 200) {
-        final errorBody = jsonDecode(response.body);
+        Map<String, dynamic> errorBody = {};
+        try {
+          errorBody = jsonDecode(response.body);
+        } catch (_) {}
         throw Exception(
-          'API error (${response.statusCode}): ${errorBody['error']?['message'] ?? response.body}',
+          'API error (${response.statusCode}) on $triedModel: ${errorBody['error']?['message'] ?? response.body}',
         );
       }
 
